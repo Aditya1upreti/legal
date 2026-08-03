@@ -1,0 +1,5 @@
+credentials/
+.env
+graph_env/
+__pycache__/
+RESEARCH/
