@@ -1,420 +1,617 @@
-import os
-import hashlib
-import logging
-from typing import Any
+"""
+Legal RAG Ingestion Pipeline — Business Legal Assistant
+======================================================
+Reads structured legal inventory and section data from Google Sheets,
+generates dense vector embeddings using a local SentenceTransformer model,
+and indexes the resulting chunks and graph topology into Qdrant and Neo4j.
+"""
 
-import gspread
-import pandas as pd
+import os
+import re
+import sys
+import uuid
+import logging
+from typing import Dict, List, Any, Tuple, Optional, Set
+from collections import defaultdict
+
 from dotenv import load_dotenv
-from google.oauth2.service_account import Credentials
+import gspread
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-from neo4j import GraphDatabase
+from qdrant_client.http import models
+from neo4j import GraphDatabase, Driver
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("LegalIngestionPipeline")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-log = logging.getLogger(__name__)
-
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USER = os.getenv("NEO4J_USER")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
-SHEET_ID = os.getenv("SHEET_ID")
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 COLLECTION_NAME = "legal_chunks"
-VECTOR_SIZE = 384
+VECTOR_DIMENSION = 384
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+UUID_NAMESPACE = uuid.NAMESPACE_DNS
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+def normalize_header(header: str) -> str:
+    """
+    Normalizes sheet column headers defensively:
+    - Strips whitespace
+    - Converts to lowercase
+    - Removes parenthetical remarks like '(ACTS ONLY)'
+    - Replaces spaces and hyphens with underscores
+    """
+    h = header.strip().lower()
+    h = re.sub(r'\(.*?\)', '', h).strip()
+    h = re.sub(r'[\s\-]+', '_', h)
+    h = re.sub(r'[^a-z0-9_]', '', h)
+    return h
+
+
+def parse_delimited_list(value: Optional[str], delimiter: str = ",") -> List[str]:
+    """Splits a delimited string and strips whitespace from elements."""
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(delimiter) if item.strip()]
+
+
+def get_deterministic_uuid(doc_id: str, section_number: str, section_title: str) -> str:
+    """Generates a reproducible UUID5 identifier for Qdrant points."""
+    key = f"{doc_id.strip()}::{section_number.strip()}::{section_title.strip()}"
+    return str(uuid.uuid5(UUID_NAMESPACE, key))
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets helpers
+# Data Loading Functions (Google Sheets)
 # ---------------------------------------------------------------------------
-
-def _get_sheets_client() -> gspread.Client:
-    creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_PATH, scopes=SCOPES)
-    return gspread.authorize(creds)
-
-
-def load_inventory() -> pd.DataFrame:
-    log.info("Loading 'Document Inventory' from Google Sheets …")
+def _load_worksheet_records(gc: gspread.Client, sheet_id: str, tab_name: str) -> List[Dict[str, Any]]:
+    """Generic helper to read a worksheet and normalize its column headers."""
     try:
-        client = _get_sheets_client()
-        sheet = client.open_by_key(SHEET_ID)
-        worksheet = sheet.worksheet("Document Inventory")
-        rows = worksheet.get_all_records()
-        df = pd.DataFrame(rows)
-        log.info("  → %d documents loaded", len(df))
-        return df
+        spreadsheet = gc.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet(tab_name)
+        all_values = worksheet.get_all_values()
+        
+        if not all_values:
+            logger.warning("Worksheet '%s' is completely empty.", tab_name)
+            return []
+
+        raw_headers = all_values[0]
+        normalized_headers = [normalize_header(h) for h in raw_headers]
+
+        # Defensive handling: ensure first column is treated as doc_id if header is missing
+        if normalized_headers and not normalized_headers[0]:
+            normalized_headers[0] = "doc_id"
+
+        records = []
+        for row_idx, row_values in enumerate(all_values[1:], start=2):
+            if not any(v.strip() for v in row_values):
+                continue  # Skip trailing empty rows
+
+            record = {}
+            for col_idx, col_name in enumerate(normalized_headers):
+                if not col_name:
+                    continue
+                val = row_values[col_idx].strip() if col_idx < len(row_values) else ""
+                record[col_name] = val
+
+            record["_row_number"] = row_idx
+            records.append(record)
+
+        return records
+
+    except gspread.exceptions.WorksheetNotFound:
+        logger.error("Tab '%s' not found in Google Sheet '%s'.", tab_name, sheet_id)
+        raise
     except Exception as e:
-        log.error("Failed to load Document Inventory: %s", e)
+        logger.error("Failed to load records from worksheet '%s': %s", tab_name, e)
         raise
 
 
-def load_structure() -> pd.DataFrame:
-    log.info("Loading 'Document Structure' from Google Sheets …")
+def load_inventory(gc: gspread.Client, sheet_id: str) -> List[Dict[str, Any]]:
+    """Loads Tab 1: Document Inventory."""
+    logger.info("Loading 'Document Inventory' tab...")
+    records = _load_worksheet_records(gc, sheet_id, "Document Inventory")
+    logger.info("Loaded %d documents from inventory.", len(records))
+    return records
+
+
+def load_structure(gc: gspread.Client, sheet_id: str) -> List[Dict[str, Any]]:
+    """Loads Tab 2: Document Structure."""
+    logger.info("Loading 'Document Structure' tab...")
+    records = _load_worksheet_records(gc, sheet_id, "Document Structure")
+    logger.info("Loaded %d structure rows.", len(records))
+    return records
+
+
+def load_tag_vocabulary(gc: gspread.Client, sheet_id: str) -> Set[str]:
+    """Loads Tab 3: Tag Vocabulary reference set."""
+    logger.info("Loading 'Tag Vocabulary' tab...")
     try:
-        client = _get_sheets_client()
-        sheet = client.open_by_key(SHEET_ID)
-        worksheet = sheet.worksheet("Document Structure")
-        rows = worksheet.get_all_records()
-        df = pd.DataFrame(rows)
-        log.info("  → %d structure rows loaded", len(df))
-        return df
+        records = _load_worksheet_records(gc, sheet_id, "Tag Vocabulary")
+        valid_tags = {r.get("tag", "").strip() for r in records if r.get("tag", "").strip()}
+        logger.info("Loaded %d valid tags into reference vocabulary.", len(valid_tags))
+        return valid_tags
     except Exception as e:
-        log.error("Failed to load Document Structure: %s", e)
-        raise
+        logger.warning("Could not load Tag Vocabulary tab (%s). Soft validation skipped.", e)
+        return set()
+
+
+def load_business_scenarios(gc: gspread.Client, sheet_id: str) -> Set[str]:
+    """Loads Tab 4: Business Scenarios reference set."""
+    logger.info("Loading 'Business Scenarios' tab...")
+    try:
+        records = _load_worksheet_records(gc, sheet_id, "Business Scenarios")
+        valid_scenarios = {r.get("scenario", "").strip() for r in records if r.get("scenario", "").strip()}
+        logger.info("Loaded %d valid business scenarios into reference vocabulary.", len(valid_scenarios))
+        return valid_scenarios
+    except Exception as e:
+        logger.warning("Could not load Business Scenarios tab (%s). Soft validation skipped.", e)
+        return set()
 
 
 # ---------------------------------------------------------------------------
-# Chunking
+# Chunking and Text Construction
 # ---------------------------------------------------------------------------
+def build_chunk_text(row: Dict[str, Any], inventory_lookup: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """
+    Constructs a clear, self-contained text paragraph for embedding.
+    Returns None if both section_number and section_title are empty.
+    """
+    doc_id = row.get("doc_id", "").strip()
+    sec_num = row.get("section_number", "").strip()
+    sec_title = row.get("section_title", "").strip()
+    
+    if not sec_num and not sec_title:
+        return None
 
-def build_chunk_text(row: dict[str, Any]) -> str:
-    """Build a self-contained chunk string from one Document Structure row."""
-    parts: list[str] = []
+    parent_doc = inventory_lookup.get(doc_id, {})
+    doc_title = parent_doc.get("title", "").strip() or f"Document {doc_id}"
+    chapter_title = row.get("chapter_title", "").strip()
+    business_relevance = row.get("business_relevance", "").strip()
+    plain_summary = row.get("plain_summary", "").strip()
 
-    doc_id = str(row.get("doc_id", "")).strip()
-    unit_type = str(row.get("unit_type", "")).strip().lower()
-    section_number = str(row.get("section_number", "")).strip()
-    section_title = str(row.get("section_title", "")).strip()
-    business_relevance = str(row.get("business_relevance", "")).strip()
-    plain_summary = str(row.get("plain_summary", "")).strip()
+    # Build Header/Context
+    prefix_elements = [f"From: {doc_title}"]
+    if chapter_title:
+        prefix_elements.append(f"— Chapter: {chapter_title}")
 
-    if unit_type == "section":
-        label = f"Section {section_number}" if section_number else "Section"
-        parts.append(f"[{doc_id}] {label}: {section_title}")
-    elif unit_type in ("issue", "holding"):
-        label = unit_type.capitalize()
-        parts.append(f"[{doc_id}] {label}: {section_title}")
-    else:
-        parts.append(f"[{doc_id}] {section_title}")
+    sec_label_parts = []
+    if sec_num:
+        sec_label_parts.append(sec_num)
+    if sec_title:
+        sec_label_parts.append(sec_title)
 
+    if sec_label_parts:
+        prefix_elements.append(f"— {': '.join(sec_label_parts)}")
+
+    header_text = " ".join(prefix_elements).strip()
+
+    # Build Body Content
+    body_elements = []
     if business_relevance:
-        parts.append(f"Business Relevance: {business_relevance}")
+        rel_str = business_relevance if business_relevance.endswith(('.', '!', '?')) else f"{business_relevance}."
+        body_elements.append(rel_str)
     if plain_summary:
-        parts.append(f"Summary: {plain_summary}")
+        body_elements.append(plain_summary)
 
-    return "\n".join(parts)
+    body_text = " ".join(body_elements).strip()
 
-
-def stable_point_id(doc_id: str, section_number: str) -> int:
-    """Deterministic int64 ID from doc_id + section_number."""
-    raw = f"{doc_id}::{section_number}"
-    digest = hashlib.sha256(raw.encode()).hexdigest()
-    return int(digest[:16], 16)
+    if header_text and body_text:
+        return f"{header_text}. {body_text}"
+    return header_text or body_text
 
 
 # ---------------------------------------------------------------------------
-# Embeddings
+# Local Embeddings
 # ---------------------------------------------------------------------------
-
-def embed_chunks(texts: list[str]) -> list[list[float]]:
-    log.info("Loading embedding model (all-MiniLM-L6-v2) …")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    log.info("  → Encoding %d chunks …", len(texts))
-    embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
-    log.info("  → Embeddings generated (%d vectors, dim=%d)", len(embeddings), len(embeddings[0]))
+def embed_chunks(texts: List[str], model: SentenceTransformer, batch_size: int = 32) -> List[List[float]]:
+    """Encodes a list of chunk strings into dense vectors in efficient batches."""
+    logger.info("Generating embeddings for %d chunks using '%s' (batch_size=%d)...", 
+                len(texts), EMBEDDING_MODEL_NAME, batch_size)
+    embeddings = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
     return embeddings.tolist()
 
 
 # ---------------------------------------------------------------------------
-# Qdrant
+# Qdrant Vector Store Ingestion
 # ---------------------------------------------------------------------------
-
-def write_to_qdrant(chunks: list[dict[str, Any]], embeddings: list[list[float]]) -> int:
-    log.info("Connecting to Qdrant at localhost:6333 …")
+def write_to_qdrant(client: QdrantClient, chunks_with_embeddings: List[Dict[str, Any]]) -> int:
+    """Ensures collection exists and upserts vectorized chunk points into Qdrant."""
+    logger.info("Writing chunks to Qdrant collection '%s'...", COLLECTION_NAME)
+    
+    # Verify or create collection
     try:
-        client = QdrantClient(url="http://localhost:6333")
-
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-        )
-        log.info("  → Collection '%s' ready", COLLECTION_NAME)
-
-        points: list[PointStruct] = []
-        for chunk, embedding in zip(chunks, embeddings):
-            payload = {
-                "doc_id": chunk["doc_id"],
-                "domain": chunk.get("domain", ""),
-                "doc_type": chunk.get("doc_type", ""),
-                "unit_type": chunk.get("unit_type", ""),
-                "section_number": chunk.get("section_number", ""),
-                "section_title": chunk.get("section_title", ""),
-                "relevance_tags": chunk.get("relevance_tags_list", []),
-                "business_scenario": chunk.get("business_scenario", ""),
-                "chunk_text": chunk["chunk_text"],
-            }
-            point = PointStruct(
-                id=stable_point_id(chunk["doc_id"], chunk.get("section_number", "")),
-                vector=embedding,
-                payload=payload,
-            )
-            points.append(point)
-
-        batch_size = 100
-        for i in range(0, len(points), batch_size):
-            batch = points[i : i + batch_size]
-            client.upsert(collection_name=COLLECTION_NAME, points=batch)
-            log.info("  → Upserted points %d–%d", i, min(i + batch_size - 1, len(points) - 1))
-
-        log.info("  → %d points written to Qdrant", len(points))
-        return len(points)
-    except Exception as e:
-        log.error("Qdrant write failed: %s", e)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Neo4j
-# ---------------------------------------------------------------------------
-
-def write_to_neo4j(inventory_df: pd.DataFrame, structure_df: pd.DataFrame) -> dict[str, int]:
-    log.info("Connecting to Neo4j at %s …", NEO4J_URI)
-    stats = {"nodes_created": 0, "rels_created": 0, "rows_skipped": 0}
-
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-    try:
-        with driver.session() as session:
-
-            # ---------- Act / Judgment nodes ----------
-            for _, row in inventory_df.iterrows():
-                try:
-                    doc_id = str(row["doc_id"]).strip()
-                    doc_type = str(row.get("doc_type", "")).strip().lower()
-                    props: dict[str, Any] = {
-                        "doc_id": doc_id,
-                        "title": str(row.get("title", "")),
-                        "domain": str(row.get("domain", "")),
-                        "year": str(row.get("year", "")),
-                        "source_url": str(row.get("source_url", "")),
-                        "file_path": str(row.get("file_path", "")),
-                    }
-                    if doc_type == "act":
-                        label = "Act"
-                        props["act_version"] = str(row.get("act_version", ""))
-                        props["status"] = str(row.get("status", ""))
-                    else:
-                        label = "Judgment"
-                        props["court"] = str(row.get("court", ""))
-                        props["judgment_status"] = str(row.get("judgment_status", ""))
-
-                    session.run(
-                        f"MERGE (d:{label} {{doc_id: $doc_id}}) "
-                        "SET d += $props",
-                        doc_id=doc_id,
-                        props=props,
-                    )
-                    stats["nodes_created"] += 1
-                except Exception as e:
-                    log.warning("Skipping inventory row doc_id=%s: %s", row.get("doc_id"), e)
-                    stats["rows_skipped"] += 1
-
-            log.info("  → %d Act/Judgment nodes created", stats["nodes_created"])
-
-            # ---------- Domain nodes & HAS_DOMAIN relationships ----------
-            domains = inventory_df["domain"].dropna().unique()
-            for domain in domains:
-                session.run(
-                    "MERGE (d:Domain {name: $name})",
-                    name=str(domain).strip(),
+        collections = client.get_collections().collections
+        exists = any(c.name == COLLECTION_NAME for c in collections)
+        if not exists:
+            logger.info("Collection '%s' does not exist. Creating collection...", COLLECTION_NAME)
+            client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=models.VectorParams(
+                    size=VECTOR_DIMENSION,
+                    distance=models.Distance.COSINE
                 )
-            session.run(
-                "MATCH (n:Act) MATCH (d:Domain {name: n.domain}) MERGE (n)-[:HAS_DOMAIN]->(d)"
             )
-            session.run(
-                "MATCH (n:Judgment) MATCH (d:Domain {name: n.domain}) MERGE (n)-[:HAS_DOMAIN]->(d)"
-            )
-            log.info("  → %d Domain nodes ready", len(domains))
-
-            # ---------- Section / Issue nodes ----------
-            for _, row in structure_df.iterrows():
-                try:
-                    doc_id = str(row["doc_id"]).strip()
-                    unit_type = str(row.get("unit_type", "")).strip().lower()
-                    section_number = str(row.get("section_number", "")).strip()
-                    section_title = str(row.get("section_title", "")).strip()
-                    page_number = str(row.get("page_number", ""))
-                    business_scenario = str(row.get("business_scenario", "")).strip()
-                    relevance_tags = str(row.get("relevance_tags", "")).strip()
-                    business_relevance = str(row.get("business_relevance", "")).strip()
-                    plain_summary = str(row.get("plain_summary", "")).strip()
-                    related_doc_ids = str(row.get("related_doc_ids", "")).strip()
-
-                    if unit_type == "section":
-                        label = "Section"
-                        parent_label = "Act"
-                        rel_type = "HAS_SECTION"
-                        uid = f"{doc_id}::{section_number}"
-                    elif unit_type in ("issue", "holding"):
-                        label = "Issue"
-                        parent_label = "Judgment"
-                        rel_type = "HAS_ISSUE"
-                        uid = f"{doc_id}::{section_number}"
-                    else:
-                        log.warning("Unknown unit_type '%s' for doc_id=%s, skipping", unit_type, doc_id)
-                        stats["rows_skipped"] += 1
-                        continue
-
-                    tags_list = [t.strip() for t in relevance_tags.split(",") if t.strip()]
-
-                    props = {
-                        "uid": uid,
-                        "doc_id": doc_id,
-                        "section_number": section_number,
-                        "section_title": section_title,
-                        "page_number": page_number,
-                        "business_scenario": business_scenario,
-                        "business_relevance": business_relevance,
-                        "plain_summary": plain_summary,
-                        "relevance_tags": tags_list,
-                    }
-
-                    session.run(
-                        f"MERGE (s:{label} {{uid: $uid}}) "
-                        "SET s += $props",
-                        uid=uid,
-                        props=props,
-                    )
-                    stats["nodes_created"] += 1
-
-                    # Link to parent Act / Judgment
-                    session.run(
-                        f"MATCH (p:{parent_label} {{doc_id: $doc_id}}) "
-                        f"MATCH (s:{label} {{uid: $uid}}) "
-                        f"MERGE (p)-[:{rel_type}]->(s)",
-                        doc_id=doc_id,
-                        uid=uid,
-                    )
-                    stats["rels_created"] += 1
-
-                    # LegalIssue node derived from business_scenario
-                    if business_scenario:
-                        session.run(
-                            "MERGE (li:LegalIssue {name: $name})",
-                            name=business_scenario,
-                        )
-                        session.run(
-                            f"MATCH (s:{label} {{uid: $uid}}) "
-                            "MATCH (li:LegalIssue {name: $name}) "
-                            "MERGE (s)-[:ADDRESSES]->(li)",
-                            uid=uid,
-                            name=business_scenario,
-                        )
-                        stats["rels_created"] += 1
-
-                    # INTERPRETS relationships (Judgment → Section)
-                    if unit_type in ("issue", "holding") and related_doc_ids:
-                        for rid in related_doc_ids.split(","):
-                            rid = rid.strip()
-                            if not rid:
-                                continue
-                            session.run(
-                                "MATCH (j:Judgment {doc_id: $doc_id}) "
-                                "MATCH (a:Act {doc_id: $rid})-[:HAS_SECTION]->(s:Section) "
-                                "MERGE (j)-[:INTERPRETS]->(s)",
-                                doc_id=doc_id,
-                                rid=rid,
-                            )
-                            stats["rels_created"] += 1
-
-                except Exception as e:
-                    log.warning("Skipping structure row doc_id=%s section=%s: %s",
-                                row.get("doc_id"), row.get("section_number"), e)
-                    stats["rows_skipped"] += 1
-
-            log.info("  → %d total nodes, %d relationships created",
-                      stats["nodes_created"], stats["rels_created"])
-
     except Exception as e:
-        log.error("Neo4j write failed: %s", e)
+        logger.error("Failed to verify or create Qdrant collection '%s': %s", COLLECTION_NAME, e)
         raise
-    finally:
-        driver.close()
 
-    return stats
+    points = []
+    for item in chunks_with_embeddings:
+        point = models.PointStruct(
+            id=item["point_id"],
+            vector=item["vector"],
+            payload=item["payload"]
+        )
+        points.append(point)
 
+    if not points:
+        logger.warning("No points to write to Qdrant.")
+        return 0
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    log.info("=" * 60)
-    log.info("  Business Legal Assistant — Ingestion Pipeline")
-    log.info("=" * 60)
-
-    # 1. Load data
-    inventory_df = load_inventory()
-    structure_df = load_structure()
-
-    log.info("\nDocuments:")
-    for _, row in inventory_df.iterrows():
-        doc_id = row.get("doc_id", "?")
-        title = row.get("title", "?")
-        n_sections = len(structure_df[structure_df["doc_id"] == doc_id])
-        log.info("  • %s — %s  (%d chunks)", doc_id, title, n_sections)
-
-    # 2. Build chunks
-    log.info("\nBuilding chunk texts …")
-    meta_lookup = inventory_df.set_index("doc_id")[["domain", "doc_type"]].to_dict("index")
-    chunks: list[dict[str, Any]] = []
-    skipped = 0
-    for _, row in structure_df.iterrows():
+    batch_size = 64
+    written_count = 0
+    for i in range(0, len(points), batch_size):
+        batch = points[i : i + batch_size]
         try:
-            row_dict = row.to_dict()
-            doc_id = str(row_dict.get("doc_id", "")).strip()
-            meta = meta_lookup.get(doc_id, {})
-            chunk_text = build_chunk_text(row_dict)
-            tags_raw = str(row_dict.get("relevance_tags", ""))
-            tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw and tags_raw.lower() != "nan" else []
-
-            chunks.append({
-                "doc_id": doc_id,
-                "domain": str(meta.get("domain", "")).strip() if meta.get("domain") else "",
-                "doc_type": str(meta.get("doc_type", "")).strip() if meta.get("doc_type") else "",
-                "unit_type": str(row_dict.get("unit_type", "")).strip(),
-                "section_number": str(row_dict.get("section_number", "")).strip(),
-                "section_title": str(row_dict.get("section_title", "")).strip(),
-                "business_scenario": str(row_dict.get("business_scenario", "")).strip() if pd.notna(row_dict.get("business_scenario")) else "",
-                "relevance_tags_list": tags_list,
-                "chunk_text": chunk_text,
-            })
+            client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=batch
+            )
+            written_count += len(batch)
         except Exception as e:
-            log.warning("Skipping row doc_id=%s: %s", row.get("doc_id"), e)
-            skipped += 1
+            logger.error("Error upserting batch %d-%d to Qdrant: %s", i, i + len(batch), e)
 
-    log.info("  → %d chunks built, %d skipped", len(chunks), skipped)
+    logger.info("Successfully upserted %d/%d points into Qdrant.", written_count, len(points))
+    return written_count
 
-    # 3. Embed
-    texts = [c["chunk_text"] for c in chunks]
-    embeddings = embed_chunks(texts)
 
-    # 4. Write to Qdrant
-    qdrant_count = write_to_qdrant(chunks, embeddings)
+# ---------------------------------------------------------------------------
+# Neo4j Graph Database Ingestion
+# ---------------------------------------------------------------------------
+def write_to_neo4j(
+    driver: Driver,
+    inventory_records: List[Dict[str, Any]],
+    structure_records: List[Dict[str, Any]]
+) -> Tuple[int, int]:
+    """Writes documents, sections, domains, scenarios, and relationships to Neo4j."""
+    logger.info("Writing inventory and structure topology to Neo4j...")
+    
+    nodes_merged = 0
+    relationships_merged = 0
 
-    # 5. Write to Neo4j
-    neo4j_stats = write_to_neo4j(inventory_df, structure_df)
+    with driver.session() as session:
+        # 1. Ingest Inventory Documents and Domain nodes
+        for doc in inventory_records:
+            doc_id = doc.get("doc_id", "").strip()
+            if not doc_id:
+                continue
 
-    # 6. Summary
-    log.info("\n" + "=" * 60)
-    log.info("  Pipeline Summary")
-    log.info("=" * 60)
-    log.info("  Documents processed     : %d", len(inventory_df))
-    log.info("  Structure rows processed: %d", len(structure_df))
-    log.info("  Chunks embedded         : %d", len(embeddings))
-    log.info("  Qdrant points written   : %d", qdrant_count)
-    log.info("  Neo4j nodes created     : %d", neo4j_stats["nodes_created"])
-    log.info("  Neo4j rels created      : %d", neo4j_stats["rels_created"])
-    log.info("  Rows skipped            : %d", neo4j_stats["rows_skipped"])
-    log.info("=" * 60)
+            doc_type_raw = doc.get("doc_type", "").strip()
+            # Normalize label: British spelling 'Judgement' preserved as standard label
+            if doc_type_raw.lower() in ("judgement", "judgment"):
+                node_label = "Judgement"
+            else:
+                node_label = "Act"
+
+            domain = doc.get("domain", "").strip()
+
+            doc_query = f"""
+            MERGE (d:{node_label} {{doc_id: $doc_id}})
+            SET d.title = $title,
+                d.domain = $domain,
+                d.doc_type = $doc_type,
+                d.year = $year,
+                d.act_version = $act_version,
+                d.court = $court,
+                d.judgement_status = $judgement_status,
+                d.source_url = $source_url,
+                d.status = $status,
+                d.pages = $pages,
+                d.reviwed_by = $reviwed_by,
+                d.notes = $notes
+            """
+            params = {
+                "doc_id": doc_id,
+                "title": doc.get("title", "").strip(),
+                "domain": domain,
+                "doc_type": doc_type_raw,
+                "year": doc.get("year", "").strip(),
+                "act_version": doc.get("act_version", "").strip(),
+                "court": doc.get("court", "").strip(),
+                "judgement_status": doc.get("judgement_status", "").strip(),
+                "source_url": doc.get("source_url", "").strip(),
+                "status": doc.get("status", "").strip(),
+                "pages": doc.get("pages", "").strip(),
+                "reviwed_by": doc.get("reviwed_by", doc.get("reviewed_by", "")).strip(),
+                "notes": doc.get("notes", "").strip(),
+            }
+
+            try:
+                session.run(doc_query, params)
+                nodes_merged += 1
+
+                if domain:
+                    domain_query = """
+                    MERGE (dom:Domain {name: $domain})
+                    WITH dom
+                    MATCH (d {doc_id: $doc_id})
+                    MERGE (d)-[:BELONGS_TO_DOMAIN]->(dom)
+                    """
+                    session.run(domain_query, {"domain": domain, "doc_id": doc_id})
+                    nodes_merged += 1
+                    relationships_merged += 1
+
+            except Exception as e:
+                logger.error("Neo4j error on document %s: %s", doc_id, e)
+
+        # 2. Ingest Structure (Sections, Scenarios, and Related Docs)
+        for row in structure_records:
+            doc_id = row.get("doc_id", "").strip()
+            sec_num = row.get("section_number", "").strip()
+            sec_title = row.get("section_title", "").strip()
+
+            if not sec_num and not sec_title:
+                continue
+
+            section_uid = f"{doc_id}::{sec_num or sec_title}"
+            relevance_tags = parse_delimited_list(row.get("relevance_tags", ""))
+            business_scenario = row.get("business_scenario", "").strip()
+            related_docs = parse_delimited_list(row.get("related_doc_ids", ""))
+
+            section_query = """
+            MERGE (s:Section {uid: $section_uid})
+            SET s.doc_id = $doc_id,
+                s.section_number = $section_number,
+                s.section_title = $section_title,
+                s.chapter_number = $chapter_number,
+                s.chapter_title = $chapter_title,
+                s.page_number = $page_number,
+                s.unit_type = $unit_type,
+                s.business_scenario = $business_scenario,
+                s.relevance_tags = $relevance_tags,
+                s.business_relevance = $business_relevance,
+                s.plain_summary = $plain_summary
+            WITH s
+            MATCH (d {doc_id: $doc_id})
+            MERGE (d)-[:HAS_SECTION]->(s)
+            """
+            section_params = {
+                "section_uid": section_uid,
+                "doc_id": doc_id,
+                "section_number": sec_num,
+                "section_title": sec_title,
+                "chapter_number": row.get("chapter_number", "").strip(),
+                "chapter_title": row.get("chapter_title", "").strip(),
+                "page_number": row.get("page_number", "").strip(),
+                "unit_type": row.get("unit_type", "").strip(),
+                "business_scenario": business_scenario,
+                "relevance_tags": relevance_tags,
+                "business_relevance": row.get("business_relevance", "").strip(),
+                "plain_summary": row.get("plain_summary", "").strip(),
+            }
+
+            try:
+                session.run(section_query, section_params)
+                nodes_merged += 1
+                relationships_merged += 1
+
+                # Scenario Node & Relationship
+                if business_scenario:
+                    scenario_query = """
+                    MATCH (s:Section {uid: $section_uid})
+                    MERGE (bs:BusinessScenario {name: $scenario})
+                    MERGE (s)-[:RELATES_TO_SCENARIO]->(bs)
+                    """
+                    session.run(scenario_query, {"section_uid": section_uid, "scenario": business_scenario})
+                    nodes_merged += 1
+                    relationships_merged += 1
+
+                # Cross-document RELATED_TO Links
+                for rel_doc_id in related_docs:
+                    rel_query = """
+                    MATCH (s:Section {uid: $section_uid})
+                    MATCH (target {doc_id: $rel_doc_id})
+                    MERGE (s)-[:RELATED_TO]->(target)
+                    """
+                    session.run(rel_query, {"section_uid": section_uid, "rel_doc_id": rel_doc_id})
+                    relationships_merged += 1
+
+            except Exception as e:
+                logger.error("Neo4j error on structure row %s (%s): %s", doc_id, section_uid, e)
+
+    return nodes_merged, relationships_merged
+
+
+# ---------------------------------------------------------------------------
+# Main Orchestrator
+# ---------------------------------------------------------------------------
+def main():
+    load_dotenv()
+
+    # Validate Environment Variables
+    neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+    neo4j_password = os.getenv("NEO4J_PASSWORD")
+    creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
+    sheet_id = os.getenv("SHEET_ID")
+    qdrant_url = os.getenv("QDRANT_URL", os.getenv("QDRANT_HOST", "http://localhost:6333"))
+
+    if not all([neo4j_password, creds_path, sheet_id]):
+        logger.error("Missing required environment variables. Please check your .env file.")
+        sys.exit(1)
+
+    if not os.path.exists(creds_path):
+        logger.error("Google service account credentials file not found at: %s", creds_path)
+        sys.exit(1)
+
+    # 1. Connect to External Services
+    logger.info("Initializing API and Database connections...")
+    try:
+        gc = gspread.service_account(filename=creds_path)
+        qdrant_client = QdrantClient(url=qdrant_url)
+        neo4j_driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+        neo4j_driver.verify_connectivity()
+    except Exception as e:
+        logger.error("Initialization failure: %s", e)
+        sys.exit(1)
+
+    # 2. Fetch Google Sheets Data
+    try:
+        inventory_records = load_inventory(gc, sheet_id)
+        structure_records = load_structure(gc, sheet_id)
+        tag_vocab = load_tag_vocabulary(gc, sheet_id)
+        scenario_vocab = load_business_scenarios(gc, sheet_id)
+    except Exception as e:
+        logger.error("Failed to read required data from Google Sheets: %s", e)
+        sys.exit(1)
+
+    # Inventory lookup mapping
+    inventory_lookup: Dict[str, Dict[str, Any]] = {
+        row.get("doc_id", "").strip(): row for row in inventory_records if row.get("doc_id", "").strip()
+    }
+
+    # Group structure rows by document for contextual progress logging
+    sections_by_doc: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in structure_records:
+        sections_by_doc[row.get("doc_id", "").strip()].append(row)
+
+    # 3. Process, Validate, and Prepare Chunks
+    logger.info("--- Starting Chunk Preparation and Soft Validation ---")
+    
+    chunks_to_embed = []
+    chunk_metadata = []
+    skipped_rows = []
+    unknown_tags = set()
+    unknown_scenarios = set()
+
+    for doc_id, doc_meta in inventory_lookup.items():
+        doc_title = doc_meta.get("title", "Untitled")
+        doc_sections = sections_by_doc.get(doc_id, [])
+        logger.info("Processing %s: %s — %d section(s) found", doc_id, doc_title, len(doc_sections))
+
+        for row in doc_sections:
+            row_num = row.get("_row_number", "Unknown")
+            sec_num = row.get("section_number", "").strip()
+            sec_title = row.get("section_title", "").strip()
+            chunk_text = build_chunk_text(row, inventory_lookup)
+
+            if not chunk_text:
+                reason = "Both section_number and section_title are empty."
+                skipped_rows.append((doc_id, row_num, reason))
+                logger.warning("Skipping Row %s in %s: %s", row_num, doc_id, reason)
+                continue
+
+            # Soft validation: Relevance Tags
+            row_tags = parse_delimited_list(row.get("relevance_tags", ""))
+            if tag_vocab:
+                for tag in row_tags:
+                    if tag not in tag_vocab:
+                        unknown_tags.add(tag)
+                        logger.warning("Soft warning: Unknown tag '%s' in %s (Row %s)", tag, doc_id, row_num)
+
+            # Soft validation: Business Scenario
+            scenario = row.get("business_scenario", "").strip()
+            if scenario and scenario_vocab:
+                if scenario not in scenario_vocab:
+                    unknown_scenarios.add(scenario)
+                    logger.warning("Soft warning: Unknown scenario '%s' in %s (Row %s)", scenario, doc_id, row_num)
+
+            point_id = get_deterministic_uuid(doc_id, sec_num, sec_title)
+            payload = {
+                "doc_id": doc_id,
+                "domain": doc_meta.get("domain", "").strip(),
+                "doc_type": doc_meta.get("doc_type", "").strip(),
+                "unit_type": row.get("unit_type", "").strip(),
+                "section_number": sec_num,
+                "section_title": sec_title,
+                "relevance_tags": row_tags,
+                "business_scenario": scenario,
+                "chunk_text": chunk_text,
+                "title": doc_title
+            }
+
+            chunks_to_embed.append(chunk_text)
+            chunk_metadata.append({
+                "point_id": point_id,
+                "payload": payload
+            })
+
+    # 4. Generate Embeddings locally
+    logger.info("--- Embedding Generation ---")
+    if chunks_to_embed:
+        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        vectors = embed_chunks(chunks_to_embed, model)
+        for meta, vec in zip(chunk_metadata, vectors):
+            meta["vector"] = vec
+    else:
+        logger.warning("No valid text chunks found to embed.")
+
+    # 5. Write to Vector DB (Qdrant)
+    logger.info("--- Writing to Qdrant ---")
+    qdrant_written = 0
+    try:
+        qdrant_written = write_to_qdrant(qdrant_client, chunk_metadata)
+    except Exception as e:
+        logger.error("Failed writing to Qdrant: %s", e)
+
+    # 6. Write to Graph DB (Neo4j)
+    logger.info("--- Writing to Neo4j ---")
+    neo4j_nodes = 0
+    neo4j_rels = 0
+    try:
+        neo4j_nodes, neo4j_rels = write_to_neo4j(neo4j_driver, inventory_records, structure_records)
+    except Exception as e:
+        logger.error("Failed writing to Neo4j: %s", e)
+    finally:
+        neo4j_driver.close()
+
+    # ---------------------------------------------------------------------------
+    # Summary Report
+    # ---------------------------------------------------------------------------
+    logger.info("==========================================================")
+    logger.info("                 INGESTION SUMMARY REPORT                 ")
+    logger.info("==========================================================")
+    logger.info("Documents Inventory Processed     : %d", len(inventory_lookup))
+    logger.info("Structure Rows Read               : %d", len(structure_records))
+    logger.info("Chunks Successfully Embedded      : %d", len(chunks_to_embed))
+    logger.info("Qdrant Points Written             : %d", qdrant_written)
+    logger.info("Neo4j Operations (Nodes / Rels)   : %d / %d", neo4j_nodes, neo4j_rels)
+    logger.info("Rows Skipped                      : %d", len(skipped_rows))
+    
+    if skipped_rows:
+        logger.info("--- Skipped Rows Breakdown ---")
+        for doc_id, row_idx, reason in skipped_rows:
+            logger.info("  * Doc: %s, Row: %s — %s", doc_id, row_idx, reason)
+
+    if unknown_tags:
+        logger.info("--- Unknown Tags Encountered (%d) ---", len(unknown_tags))
+        logger.info("  %s", ", ".join(sorted(unknown_tags)))
+
+    if unknown_scenarios:
+        logger.info("--- Unknown Scenarios Encountered (%d) ---", len(unknown_scenarios))
+        logger.info("  %s", ", ".join(sorted(unknown_scenarios)))
+
+    logger.info("==========================================================")
+    logger.info("Pipeline run completed successfully.")
 
 
 if __name__ == "__main__":
