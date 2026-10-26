@@ -196,6 +196,15 @@ def main():
             "raw_context": raw_ctx,
         })
 
+        # Show citation validation warning
+        citation_check = result.get("citation_check", {})
+        unverified = citation_check.get("unverified", [])
+        if unverified:
+            st.warning(
+                f"⚠️ {len(unverified)} citation(s) in the answer were not found in the retrieved sources. "
+                f"These citations may not be supported by the current context."
+            )
+
     # --- Chat input ---
     user_question = st.chat_input("Ask a business-legal question...")
 
@@ -229,6 +238,14 @@ def main():
             "raw_context": raw_ctx,
         })
 
+        # Show citation validation warning
+        citation_check = result.get("citation_check", {})
+        unverified = citation_check.get("unverified", [])
+        if unverified:
+            st.warning(
+                f"⚠️ {len(unverified)} citation(s) in the answer were not found in the retrieved sources. "
+                f"These citations may not be supported by the current context."
+            )
 
 if __name__ == "__main__":
     main()

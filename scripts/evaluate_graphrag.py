@@ -16,8 +16,11 @@ import json
 import matplotlib.pyplot
 from typing import Dict, List, Any, Tuple, Set
 
-# Add project root to path so we can import the pipeline script
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Add project root to path so the script works whether run from project root or scripts/
+import os
+import sys
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 from scripts.retrieve_and_answer import retrieve_context, answer_question
 
 # ---------------------------------------------------------------------------
@@ -57,24 +60,16 @@ def get_why_label(graph_context: List[Dict[str, Any]], target_uid: str) -> str:
 # ---------------------------------------------------------------------------
 def retrieve_vector_only(question: str, top_k: int = 5) -> dict:
     """
-    Pure vector-search baseline — same Qdrant step as retrieve_context()
-    but WITHOUT the Neo4j graph expansion.
-    Returns the vector_hits list from retrieve_context's internal logic.
+    Pure vector-search baseline — uses only Qdrant and the embedding model,
+    WITHOUT any Neo4j graph expansion.
+    Returns the vector_hits dict.
     """
     logger.info("Retrieving vector-only context for: %s", question[:60])
 
-    # Load env + Qdrant setup (reused from retrieve_and_answer.py patterns)
     from dotenv import load_dotenv
     load_dotenv()
 
-    neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-    neo4j_password = os.getenv("NEO4J_PASSWORD")
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-
-    if not neo4j_password:
-        logger.error("Missing NEO4J_PASSWORD in environment.")
-        return {"vector_hits": [], "graph_context": [], "score": None}
 
     from sentence_transformers import SentenceTransformer
     from qdrant_client import QdrantClient

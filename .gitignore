@@ -2,4 +2,6 @@ credentials/
 .env
 graph_env/
 __pycache__/
+qdrant_storage/
+batch_output.txt
 RESEARCH/

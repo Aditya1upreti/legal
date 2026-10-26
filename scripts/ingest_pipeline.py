@@ -341,7 +341,7 @@ def write_to_neo4j(
                 "source_url": doc.get("source_url", "").strip(),
                 "status": doc.get("status", "").strip(),
                 "pages": doc.get("pages", "").strip(),
-                "reviwed_by": doc.get("reviwed_by", doc.get("reviewed_by", "")).strip(),
+                "reviwed_by": (doc.get("reviwed_by") or doc.get("reviewed_by") or doc.get("reviewedBy") or doc.get("reviewed-by")).strip() or "",
                 "notes": doc.get("notes", "").strip(),
             }
 

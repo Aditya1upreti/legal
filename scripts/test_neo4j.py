@@ -13,8 +13,9 @@ def test_connection():
     driver = GraphDatabase.driver(URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     try:
         with driver.session() as session:
-            session.run("MERGE (c:Document {title: 'Constitution of India'})")
-            print("✅ Successfully connected and created the root node!")
+            result = session.run("RETURN 1")
+            record = result.single()
+            print(f"✅ Neo4j connection verified — RETURN 1: {record[0]}")
     except Exception as e:
         print(f"❌ Connection failed: {e}")
     finally:

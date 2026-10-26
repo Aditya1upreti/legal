@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
+import google.genai as genai
 from neo4j import GraphDatabase
 
 
@@ -344,22 +345,38 @@ Provide a grounded, cited answer based solely on the sources above"""
 def generate_answer(question: str, context: dict) -> str:
     """
     Call the Google Gemini API with the prompt built from context.
-    Handle API errors gracefully.
+    Handle API errors gracefully, including rate limits.
     """
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return "Error: GEMINI_API_KEY not found in environment variables."
+        return "Error: GEMINI_API_KEY not found in environment variables.\nSet GEMINI_API_KEY in your .env file."
 
     try:
         client = genai.Client(api_key=api_key)
 
         prompt = build_prompt(question, context)
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
+        # First attempt
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt
+            )
+        except Exception as e:
+            # Check for rate limit error (429) and retry once
+            err_str = str(e)
+            if "429" in err_str or "rate limit" in err_str.lower() or "quota" in err_str.lower():
+                logger.info("Rate limit hit, retrying after brief wait...")
+                import time
+                time.sleep(2)
+                # Retry once
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt
+                )
+            else:
+                raise
 
         return response.text
 
@@ -373,12 +390,13 @@ def generate_answer(question: str, context: dict) -> str:
 def answer_question(question: str) -> dict:
     """
     Orchestrate: retrieve_context() -> build_prompt() -> generate_answer()
-    Returns: {"question": ..., "answer": ..., "sources_used": [...], "raw_context": ...}
+    Returns: {"question": ..., "answer": ..., "sources_used": [...], "raw_context": ..., "citation_check": ...}
     """
     raw_context = retrieve_context(question, top_k=5)
 
     # Build sources_used list from both vector_hits and graph_context
     sources_used = set()
+    sources_list = []  # list of (title, sec_num, source_url) for easy checking
 
     # From vector hits
     for hit in raw_context.get("vector_hits", []):
@@ -389,6 +407,7 @@ def answer_question(question: str) -> dict:
         source_url = payload.get("source_url", "")
         if doc_id and sec_num:
             sources_used.add((title, sec_num, source_url))
+            sources_list.append((title.strip().lower(), sec_num.strip(), source_url))
 
     # From graph context
     for ctx in raw_context.get("graph_context", []):
@@ -398,14 +417,41 @@ def answer_question(question: str) -> dict:
         # We'll use a placeholder if not available
         if sec_num and title != "Unknown":
             sources_used.add((title, sec_num, ""))
+            sources_list.append((title.strip().lower(), sec_num.strip(), ""))
 
     answer = generate_answer(question, raw_context)
+
+    # --- Citation validation ---
+    verified = []
+    unverified = []
+    # Extract citations of the form (Source: <title>, <section>) from the answer
+    import re
+    citation_pattern = re.compile(r"\(Source:\s*([^\),]+)\s*,\s*([^)]+)\)", re.IGNORECASE)
+    found_citations = citation_pattern.findall(answer)
+    
+    # Build a set of available (title_lower, sec_num) for quick lookup
+    available = {(t, s) for t, s, _ in sources_list}
+    
+    for title, sec in found_citations:
+        title_clean = title.strip().lower()
+        sec_clean = sec.strip()
+        if (title_clean, sec_clean) in available or (title_clean, sec_clean.rstrip('.')) in available:
+            verified.append((title, sec))
+        else:
+            unverified.append((title, sec))
+    
+    citation_check = {
+        "verified": verified,
+        "unverified": unverified,
+        "total": len(found_citations)
+    }
 
     return {
         "question": question,
         "answer": answer,
         "sources_used": sorted(list(sources_used)),
-        "raw_context": raw_context
+        "raw_context": raw_context,
+        "citation_check": citation_check
     }
 
 
